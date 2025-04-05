@@ -6,7 +6,6 @@ import threading
 import os
 import struct
 import numpy as np
-import random
 from datetime import datetime
 
 # Global variables
@@ -28,35 +27,6 @@ status_data = {
     'imu_roll': 0.0,
     'imu_yaw': 0.0
 }
-mcu_data = {
-    'pressure': 1013.25,     # hPa
-    'internal_temp': 35.0,   # Celsius
-    'humidity': 45.0,        # Percent
-    'leak_sensor': 0.0,      # Voltage (higher = possible leak)
-    'motor_current_1': 0.0,  # Amps
-    'motor_current_2': 0.0,  # Amps
-    'motor_current_3': 0.0,  # Amps
-    'motor_current_4': 0.0   # Amps
-}
-
-def generate_dummy_mcu_data():
-    """Generate varying dummy data simulating MCU sensor readings"""
-    global mcu_data
-    while not stop_event.is_set():
-        # Add random variations to simulate real sensor readings
-        mcu_data['pressure'] = 1013.25 + random.uniform(-2.0, 2.0)
-        mcu_data['internal_temp'] = 35.0 + random.uniform(-0.5, 0.5)
-        mcu_data['humidity'] = 45.0 + random.uniform(-2.0, 2.0)
-        mcu_data['leak_sensor'] = max(0.0, random.uniform(-0.01, 0.02))
-        
-        # Simulate motor currents based on throttle command
-        base_current = abs(control_data['throttle']) * 2.0
-        mcu_data['motor_current_1'] = base_current + random.uniform(-0.2, 0.2)
-        mcu_data['motor_current_2'] = base_current + random.uniform(-0.2, 0.2)
-        mcu_data['motor_current_3'] = abs(control_data['steering']) * 1.5 + random.uniform(-0.1, 0.1)
-        mcu_data['motor_current_4'] = abs(control_data['steering']) * 1.5 + random.uniform(-0.1, 0.1)
-        
-        time.sleep(0.1)  # Update 10 times per second
 
 def capture_frames():
     """Capture frames using libcamera-vid and pipe to OpenCV"""
@@ -79,12 +49,16 @@ def capture_frames():
             global current_frame
             current_frame = frame
             
-            # No local display needed for submersible
+            # Display frame locally (optional)
+            cv2.imshow('Raspberry Pi Camera', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
     finally:
         process.terminate()
+        cv2.destroyAllWindows()
 
 def data_sender(client_socket):
-    """Send camera frames, status data, and MCU data to server"""
+    """Send camera frames and status data to server"""
     frame_count = 0
     
     while not stop_event.is_set():
@@ -100,11 +74,6 @@ def data_sender(client_socket):
             if status_data['imu_pitch'] > 10.0:
                 status_data['imu_pitch'] = -10.0
             
-            # Simulate battery drain
-            status_data['battery'] -= 0.001
-            if status_data['battery'] < 10.0:
-                status_data['battery'] = 10.0
-            
             # Serialize status data
             status_bytes = struct.pack('!fffffff', 
                                      status_data['depth'],
@@ -115,28 +84,17 @@ def data_sender(client_socket):
                                      status_data['imu_roll'],
                                      status_data['imu_yaw'])
             
-            # Serialize MCU data
-            mcu_bytes = struct.pack('!ffffffff',
-                                   mcu_data['pressure'],
-                                   mcu_data['internal_temp'],
-                                   mcu_data['humidity'],
-                                   mcu_data['leak_sensor'],
-                                   mcu_data['motor_current_1'],
-                                   mcu_data['motor_current_2'],
-                                   mcu_data['motor_current_3'],
-                                   mcu_data['motor_current_4'])
-            
             # Get current timestamp
             timestamp = datetime.now().timestamp()
             timestamp_bytes = struct.pack('!d', timestamp)
             
             # Create custom packet:
-            # Format: [timestamp(8)][status_data(28)][mcu_data(32)][frame_size(4)][frame_data(variable)]
+            # Format: [timestamp(8 bytes)][status_data(28 bytes)][frame_size(4 bytes)][frame_data(variable)]
             frame_size = len(frame_data)
             frame_size_bytes = struct.pack('!I', frame_size)
             
             # Combine all parts into a packet
-            packet = timestamp_bytes + status_bytes + mcu_bytes + frame_size_bytes + frame_data
+            packet = timestamp_bytes + status_bytes + frame_size_bytes + frame_data
             
             try:
                 # Send the packet size first
@@ -147,9 +105,10 @@ def data_sender(client_socket):
                 client_socket.sendall(packet)
                 
                 frame_count += 1
-                if frame_count % 100 == 0:  # Print status less frequently to reduce console output
+                if frame_count % 30 == 0:  # Print status every 30 frames
                     print(f"Sent frame {frame_count}, size: {frame_size} bytes")
-                    print(f"MCU data: pressure={mcu_data['pressure']:.2f}hPa, temp={mcu_data['internal_temp']:.1f}°C")
+                    print(f"Current status: depth={status_data['depth']:.1f}m, temp={status_data['temperature']:.1f}°C, "
+                          f"battery={status_data['battery']:.1f}%, IMU: pitch={status_data['imu_pitch']:.1f}°")
                 
             except Exception as e:
                 print(f"Error sending frame: {e}")
@@ -188,6 +147,10 @@ def control_receiver(client_socket):
             cmd_type = cmd_bytes[8]
             cmd_data = cmd_bytes[9:]
             
+            server_time = datetime.fromtimestamp(timestamp)
+            client_time = datetime.now()
+            time_diff = (client_time.timestamp() - timestamp) * 1000  # in ms
+            
             # Process command based on type
             if cmd_type == 1:  # Movement command
                 new_control = struct.unpack('!fffff', cmd_data)
@@ -197,11 +160,16 @@ def control_receiver(client_socket):
                 control_data['lights'] = new_control[3]
                 control_data['camera_tilt'] = new_control[4]
                 
-                print(f"COMMAND: throttle={control_data['throttle']:.2f}, steering={control_data['steering']:.2f}, depth={control_data['depth']:.2f}")
+                print(f"Received control: throttle={control_data['throttle']:.2f}, "
+                      f"steering={control_data['steering']:.2f}, depth={control_data['depth']:.2f}, "
+                      f"lights={'ON' if control_data['lights'] > 0.5 else 'OFF'}, "
+                      f"camera_tilt={control_data['camera_tilt']:.2f}")
+                print(f"Command latency: {time_diff:.2f} ms")
+
                 
             elif cmd_type == 2:  # Configuration command
                 config_str = cmd_data.decode('utf-8')
-                print(f"CONFIG: {config_str}")
+                print(f"Received config: {config_str}")
                 
                 # Process configuration command
                 try:
@@ -233,11 +201,6 @@ def start_client():
     capture_thread.daemon = True
     capture_thread.start()
     
-    # Start dummy MCU data generation thread
-    mcu_thread = threading.Thread(target=generate_dummy_mcu_data)
-    mcu_thread.daemon = True
-    mcu_thread.start()
-    
     # Wait for first frame
     print("Waiting for camera to initialize...")
     while current_frame is None and not stop_event.is_set():
@@ -249,7 +212,6 @@ def start_client():
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         client_socket.connect(('192.168.1.100', 8000))  # Server IP address
-        print("Connected to surface vessel")
         
         # Start threads for sending frames/status and receiving commands
         sender_thread = threading.Thread(target=data_sender, args=(client_socket,))
@@ -262,9 +224,9 @@ def start_client():
         receiver_thread.start()
         
         # Main loop to keep program running
-        print("Submersible running. Press Ctrl+C to exit.")
+        print("Client running. Press Ctrl+C to exit.")
         try:
-            while not stop_event.is_set():
+            while True:
                 time.sleep(1)
         except KeyboardInterrupt:
             print("Shutting down...")
@@ -277,7 +239,7 @@ def start_client():
         # Clean up resources
         stop_event.set()
         client_socket.close()
-        print("Submersible stopped")
+        print("Client stopped")
 
 if __name__ == "__main__":
     start_client()
